@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 unity_to_godot.py
 =================
@@ -181,35 +181,73 @@ def fmt(v: float) -> str:
 
 ORM_MAS_RE = re.compile(r"^(.*)_(?:ORM_)?MAS$", re.I)
 
+# Known metal/roughness/AO packings. The channel triple is (metallic, roughness, AO).
+PACKINGS = {
+    # R=AO, G=roughness, B=metallic -- Godot's native ORM layout (ORM / ARM / ORMH ...)
+    "native": (2, 1, 0),
+    # R=metallic, G=roughness, B=AO
+    "mra": (0, 1, 2),
+}
 
-def resolve_orm_texture(
-    metallic_tex: Path | None, ao_tex: Path | None
-) -> tuple[str | None, Path | None]:
-    """Work out which texture drives metallic/roughness/AO and how it is packed.
+# suffixes that use the native R=AO / G=rough / B=metal layout
+NATIVE_SUFFIXES = ("_ORM", "_ARM", "_ORMH", "_AOR", "_RMA", "_RMO")
+MRA_SUFFIXES = ("_MRA", "_MRAO")
+ROUGHNESS_SUFFIXES = ("_R", "_ROUGH", "_ROUGHNESS")
+MASK_SUFFIXES = ("_MAS", "_MASK", "_MASKRBG", "_MASKRGB", "_MSK")
 
-    Returns (packing, texture) where packing is:
-      "orm"  -> R=AO, G=roughness, B=metallic  (Godot's native ORM layout)
-      "mask" -> R=metallic, G=AO, A=smoothness (Unity URP mask map)
-      None   -> no map, use scalar values
 
-    Asset packs exported for several engines usually ship both `T_X_ORM.png`
-    (Unreal/Godot layout) and `T_X_ORM_MAS.png` (Unity mask layout). Unity
-    materials reference the MAS variant, so prefer the ORM sibling when present.
+def _classify_surface_texture(path: Path) -> str:
+    """Guess the channel layout of a metal/roughness/AO texture from its name."""
+    s = path.stem.upper()
+    if s.endswith(MASK_SUFFIXES):
+        return "mask"
+    if s.endswith(MRA_SUFFIXES):
+        return "mra"
+    if s.endswith(NATIVE_SUFFIXES):
+        return "native"
+    if s.endswith(ROUGHNESS_SUFFIXES):
+        return "roughness"
+    return "native"
+
+
+def resolve_surface_texture(metallic_tex: Path | None, ao_tex: Path | None) -> dict:
+    """Work out which texture drives metallic/roughness/AO and how its channels are packed.
+
+    Asset packs ship a different convention per pack, and Unity materials usually reference
+    the *Unity* variant of it:
+
+      `T_X_ORM_MAS.png`  Unity mask (R=metal, G=AO, A=smoothness) -- sibling `T_X_ORM.png`
+                         exists and is already in Godot's layout (R=AO, G=rough, B=metal)
+      `T_X_ARM_MAS.png`  same story, `T_X_ARM.png` is R=AO, G=rough, B=metal
+      `T_X_MAS.png`      Unity mask only, `T_X_MRA.png` is R=metal, G=rough, B=AO
+      `T_X_R_MAS.png`    Unity mask plus a separate roughness map `T_X_R.png`
+
+    Returns {"kind": ..., ...} with kind in {"native", "mra", "mask", "mask_rough", None}.
     """
     for cand in (metallic_tex, ao_tex):
         if cand is None:
             continue
-        m = ORM_MAS_RE.match(cand.stem)
-        if m:
-            sibling = cand.with_name(m.group(1) + cand.suffix)
-            if sibling.exists():
-                return "orm", sibling
-            return "mask", cand
-        if "orm" in cand.stem.lower():
-            return "orm", cand
-    if metallic_tex is not None and metallic_tex == ao_tex:
-        return "mask", metallic_tex
-    return None, None
+        stem = cand.stem
+        base = stem[:-4] if stem.upper().endswith("_MAS") else stem
+        # 1) sibling without the Unity suffix, e.g. T_X_ORM_MAS -> T_X_ORM
+        for extra in ("", "_ORM", "_ARM", "_ORMH", "_MRA", "_R", "_O"):
+            name = base + extra + cand.suffix
+            if name == cand.name:
+                continue
+            sib = cand.with_name(name)
+            if sib.exists():
+                kind = _classify_surface_texture(sib)
+                if kind == "roughness":
+                    # keep the mask for metallic/AO, take roughness from the grey map
+                    return {"kind": "mask_rough", "mask": cand, "rough": sib}
+                if kind in PACKINGS:
+                    return {"kind": kind, "tex": sib}
+        # 2) no sibling: use the file itself
+        kind = _classify_surface_texture(cand)
+        if kind in PACKINGS:
+            return {"kind": kind, "tex": cand}
+        return {"kind": "mask", "mask": cand}
+    return {"kind": None}
 
 
 def color_literal(c: tuple[float, float, float, float]) -> str:
@@ -224,6 +262,8 @@ class MaterialBuilder:
         self.dest = dest
         self.textures_subdir = "textures"
         self.used_textures: set[Path] = set()
+        self.alpha_inverted: set[str] = set()   # textures whose alpha must be inverted at import
+        self.packing_counts: dict[str, int] = {}
 
     # -- helpers -----------------------------------------------------------------
     def res_path(self, unity_asset: Path) -> str:
@@ -283,41 +323,63 @@ class MaterialBuilder:
             props.append(f"normal_scale = {fmt(floats.get('_BumpScale', 1.0))}")
 
         # ---- metallic / roughness / AO ------------------------------------------
-        # Unity URP stores either an ORM map (R=AO, G=roughness, B=metallic â€” the
-        # Unreal-style packing this asset pack uses) or a Metallic/Smoothness map
-        # (R=metallic, A=smoothness). Godot's ORM layout is R=AO, G=rough, B=metal.
-        mg_tex = self.tex_by_guid((texenvs.get("_MetallicGlossMap") or {}).get("guid"))
-        ao_tex = self.tex_by_guid((texenvs.get("_OcclusionMap") or {}).get("guid"))
-        packing, orm_tex = resolve_orm_texture(mg_tex, ao_tex)
-
+        # Unity materials point at a mask map (R=metallic, G=AO, A=smoothness); the
+        # sibling textures carry the same data in a layout Godot can sample directly.
         metallic = floats.get("_Metallic", 0.0)
         smoothness = floats.get("_Smoothness", floats.get("_Glossiness", 0.5))
+        plan = resolve_surface_texture(
+            self.tex_by_guid((texenvs.get("_MetallicGlossMap") or {}).get("guid")),
+            self.tex_by_guid((texenvs.get("_OcclusionMap") or {}).get("guid")),
+        )
+        kind = plan.get("kind")
+        key = kind or "scalar"
+        self.packing_counts[key] = self.packing_counts.get(key, 0) + 1
 
-        if packing == "orm" and orm_tex is not None:
-            # already in Godot's layout: R = AO, G = roughness, B = metallic
-            rid = add_tex("orm", orm_tex)
+        def surface_channels(m_ch: int, r_ch: int, a_ch: int) -> None:
+            rid = add_tex("orm", plan["tex"])
             props.append(f'metallic_texture = ExtResource("{rid}")')
-            props.append("metallic_texture_channel = 2")   # B
+            props.append(f"metallic_texture_channel = {m_ch}")
             props.append(f'roughness_texture = ExtResource("{rid}")')
-            props.append("roughness_texture_channel = 1")  # G
+            props.append(f"roughness_texture_channel = {r_ch}")
             props.append(f'ao_texture = ExtResource("{rid}")')
-            props.append("ao_texture_channel = 0")         # R
+            props.append(f"ao_texture_channel = {a_ch}")
             props.append("ao_enabled = true")
-            # scalars act as multipliers on the sampled channels
             props.append("metallic = 1.0")
             props.append("roughness = 1.0")
             props.append("metallic_specular = 0.5")
-        elif packing == "mask" and orm_tex is not None:
-            # Unity URP mask map: R = metallic, G = AO, A = smoothness
-            rid = add_tex("mask", orm_tex)
+
+        if kind in PACKINGS:
+            surface_channels(*PACKINGS[kind])
+        elif kind == "mask_rough":
+            # Unity mask for metallic/AO + a separate grey roughness map
+            rid = add_tex("mask", plan["mask"])
             props.append(f'metallic_texture = ExtResource("{rid}")')
             props.append("metallic_texture_channel = 0")   # R
             props.append(f'ao_texture = ExtResource("{rid}")')
             props.append("ao_texture_channel = 1")         # G
             props.append("ao_enabled = true")
+            rrid = add_tex("rough", plan["rough"])
+            props.append(f'roughness_texture = ExtResource("{rrid}")')
+            props.append("roughness_texture_channel = 0")
             props.append("metallic = 1.0")
-            props.append(f"roughness = {fmt(1.0 - smoothness)}")
+            props.append("roughness = 1.0")
             props.append("metallic_specular = 0.5")
+        elif kind == "mask":
+            # Unity URP mask map: R = metallic, G = AO, A = smoothness.
+            # Godot samples roughness directly, so the alpha channel gets inverted at
+            # import time (process/channel_remap/alpha = 7) and read back as roughness.
+            rid = add_tex("mask", plan["mask"])
+            props.append(f'metallic_texture = ExtResource("{rid}")')
+            props.append("metallic_texture_channel = 0")   # R
+            props.append(f'ao_texture = ExtResource("{rid}")')
+            props.append("ao_texture_channel = 1")         # G
+            props.append("ao_enabled = true")
+            props.append(f'roughness_texture = ExtResource("{rid}")')
+            props.append("roughness_texture_channel = 3")  # A (inverted smoothness)
+            props.append("metallic = 1.0")
+            props.append("roughness = 1.0")
+            props.append("metallic_specular = 0.5")
+            self.alpha_inverted.add(plan["mask"].name)
         else:
             props.append(f"metallic = {fmt(metallic)}")
             props.append(f"roughness = {fmt(1.0 - smoothness)}")
@@ -390,6 +452,49 @@ def tf_string(
     return "Transform3D({})".format(", ".join(fmt(v) for v in vals))
 
 
+def quat_matrix(q: tuple[float, float, float, float]) -> list[list[float]]:
+    """Rotation matrix (row-major, columns = rotated axes) for a Unity/Godot quaternion."""
+    x, y, z, w = q
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+
+
+def prefab_footprint(
+    rotation: tuple[float, float, float, float],
+    position: tuple[float, float, float],
+    scale: tuple[float, float, float],
+    aabb: list[float] | None,
+) -> tuple[float, float, float]:
+    """World-space (width, depth, height) of a prefab, from its mesh AABB."""
+    if not aabb or len(aabb) != 6:
+        return (1.0, 1.0, 1.0)
+    mn = aabb[:3]
+    size = aabb[3:]
+    m = quat_matrix(rotation)
+    sx, sy, sz = scale
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    for i in range(8):
+        lx = mn[0] + (size[0] if i & 1 else 0.0)
+        ly = mn[1] + (size[1] if i & 2 else 0.0)
+        lz = mn[2] + (size[2] if i & 4 else 0.0)
+        for axis in range(3):
+            v = (
+                m[axis][0] * lx * sx
+                + m[axis][1] * ly * sy
+                + m[axis][2] * lz * sz
+                + position[axis]
+            )
+            lo[axis] = min(lo[axis], v)
+            hi[axis] = max(hi[axis], v)
+    return (hi[0] - lo[0], hi[2] - lo[2], hi[1] - lo[1])
+
+
 def quat_to_transform(
     q: tuple[float, float, float, float],
     pos: tuple[float, float, float],
@@ -401,14 +506,7 @@ def quat_to_transform(
     importer already performs the axis conversion on the geometry, so the prefab's
     local transform is copied numerically. Scale is baked into the basis vectors.
     """
-    x, y, z, w = q
-    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
-    x, y, z, w = x / n, y / n, z / n, w / n
-    m = [
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ]
+    m = quat_matrix(q)
     sx, sy, sz = scale
     x_axis = (m[0][0] * sx, m[1][0] * sx, m[2][0] * sx)
     y_axis = (m[0][1] * sy, m[1][1] * sy, m[2][1] * sy)
@@ -488,13 +586,24 @@ func _init() -> void:
 			push_warning("no mesh inside " + f)
 			inst.free()
 			continue
-		# drop the placeholder materials created by the FBX importer
-		for i in mesh.get_surface_count():
+		# drop the placeholder materials created by the FBX importer, but remember their
+		# names first: Unity merges submeshes that share a material, Godot keeps them apart
+		var surfaces := mesh.get_surface_count()
+		var surface_materials := []
+		for i in surfaces:
+			var m = mesh.surface_get_material(i)
+			surface_materials.append(m.resource_name if m != null else "")
 			mesh.surface_set_material(i, null)
 		var out_path := out_dir.path_join(f.get_basename() + ".res")
 		var err := ResourceSaver.save(mesh, out_path)
+		var aabb := mesh.get_aabb()
 		if err == OK:
-			result[f] = out_path
+			result[f] = {
+				"path": out_path,
+				"surfaces": surfaces,
+				"surface_materials": surface_materials,
+				"aabb": [aabb.position.x, aabb.position.y, aabb.position.z, aabb.size.x, aabb.size.y, aabb.size.z],
+			}
 		else:
 			push_error("failed saving " + out_path)
 		inst.free()
@@ -580,9 +689,14 @@ def index_unity_texture_settings(unity_dir: Path) -> dict[str, dict]:
     return out
 
 
-def patch_texture_imports(textures_dir: Path, unity_settings: dict[str, dict] | None = None) -> int:
+def patch_texture_imports(
+    textures_dir: Path,
+    unity_settings: dict[str, dict] | None = None,
+    alpha_inverted: set[str] | None = None,
+) -> int:
     """Set 3D-friendly import flags, mark normal maps and fix their green channel."""
     unity_settings = unity_settings or {}
+    alpha_inverted = alpha_inverted or set()
     changed = 0
     for imp in textures_dir.glob("*.import"):
         text = imp.read_text(encoding="utf-8")
@@ -597,6 +711,8 @@ def patch_texture_imports(textures_dir: Path, unity_settings: dict[str, dict] | 
         # DirectX-style (Y-) source map -> invert green so it becomes OpenGL-style (Y+).
         invert_y = is_normal and settings.get("flip_green", False)
         params["process/normal_map_invert_y"] = "true" if invert_y else "false"
+        # Unity mask maps store *smoothness* in the alpha channel; Godot wants roughness.
+        params["process/channel_remap/alpha"] = "7" if image_name in alpha_inverted else "3"
         new = text
         for key, value in params.items():
             pat = re.compile(rf"^{re.escape(key)}=.*$", re.M)
@@ -610,25 +726,101 @@ def patch_texture_imports(textures_dir: Path, unity_settings: dict[str, dict] | 
     return changed
 
 
+def map_materials_to_surfaces(
+    mat_paths: list[str | None], surface_materials: list[str]
+) -> tuple[dict[int, str], bool]:
+    """Distribute Unity's per-submesh material list over the Godot mesh surfaces.
+
+    Unity merges submeshes that share a material at import time, Godot's FBX importer does
+    not. When the mesh therefore has more surfaces than the prefab has material slots, the
+    surfaces are grouped by their FBX placeholder material name (a run of equal names is one
+    Unity submesh) and each group gets one material.
+
+    Returns ({surface index: material res path}, merged_flag).
+    """
+    resolved = [(i, p) for i, p in enumerate(mat_paths) if p]
+    n_surf = len(surface_materials)
+    if not surface_materials or len(mat_paths) > n_surf:
+        return dict(resolved), False
+
+    groups: list[list[int]] = []
+    for i, name in enumerate(surface_materials):
+        if groups and surface_materials[groups[-1][0]] == name:
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+    # Unity merged the submeshes that share a material: the runs line up with the material
+    # list while the raw surface count is larger.
+    if len(groups) == len(mat_paths) and len(groups) < n_surf:
+        return {i: mat_paths[gi] for gi, idxs in enumerate(groups) for i in idxs if mat_paths[gi]}, True  # type: ignore[misc]
+    return dict(resolved), False
+
+
 def write_showcase(
     out_path: Path,
-    prefabs: list[tuple[str, str]],
+    prefabs: list[tuple[str, str, float, float, float]],
     *,
-    columns: int = 10,
-    spacing: float = 2.6,
+    margin: float = 0.9,
+    max_row_width: float = 0.0,
 ) -> None:
-    """Build a scene that instances every prefab on a grid with a floor, sun and camera."""
-    n = len(prefabs)
-    rows = max(1, math.ceil(n / columns))
-    width = (columns - 1) * spacing
-    depth = (rows - 1) * spacing
+    """Shelf-pack every prefab into size-aware cells, with a floor, sun, sky and camera.
+
+    `prefabs` is a list of (name, res path, width, depth, height). Cells are as large as the
+    object needs, so architectural pieces (walls, towers) do not overlap their neighbours the
+    way they would on a fixed grid.
+    """
+    cells = [
+        {
+            "name": name,
+            "res": res,
+            "w": max(w, 0.6) + margin,
+            "d": max(d, 0.6) + margin,
+            "h": max(h, 0.2),
+        }
+        for name, res, w, d, h in prefabs
+    ]
+    if not cells:
+        return
+
+    total_area = sum(c["w"] * c["d"] for c in cells)
+    row_target = max_row_width or max(10.0, math.sqrt(total_area) * 1.9)
+
+    rows: list[list[dict]] = []
+    cur: list[dict] = []
+    cur_w = 0.0
+    for c in cells:
+        if cur and cur_w + c["w"] > row_target:
+            rows.append(cur)
+            cur, cur_w = [], 0.0
+        cur.append(c)
+        cur_w += c["w"]
+    if cur:
+        rows.append(cur)
+
+    placed: list[tuple[dict, float, float, float]] = []   # cell, x, z, row depth
+    z = 0.0
+    for row in rows:
+        row_d = max(c["d"] for c in row)
+        row_w = sum(c["w"] for c in row)
+        x = -row_w / 2.0
+        for c in row:
+            placed.append((c, x + c["w"] / 2.0, z + row_d / 2.0, row_d))
+            x += c["w"]
+        z += row_d
+    depth = z
+    z_shift = -depth / 2.0
+
+    xs = [p[1] for p in placed]
+    width = (max(xs) - min(xs)) if placed else 10.0
+    max_height = max(c["h"] for c in cells)
 
     ext_lines = [
-        f'[ext_resource type="PackedScene" path="res://{res}" id="p{i}"]' for i, (_, res) in enumerate(prefabs)
+        f'[ext_resource type="PackedScene" path="res://{p[0]["res"]}" id="p{i}"]'
+        for i, p in enumerate(placed)
     ]
 
-    floor_w = max(24.0, width + spacing * 6)
-    floor_d = max(24.0, depth + spacing * 6)
+    floor_w = max(24.0, width + margin * 8)
+    floor_d = max(24.0, depth + margin * 8)
 
     sub_lines = [
         '[sub_resource type="PlaneMesh" id="PlaneMesh_floor"]',
@@ -660,12 +852,14 @@ def write_showcase(
         "glow_intensity = 0.35",
     ]
 
-    # camera: frame the whole grid (binary-searched distance + centred target)
-    cam_pos, cam_target, cam_x, cam_y, cam_z = fit_camera(width + spacing * 1.2, depth + spacing * 1.2, max_height=2.6, margin=0.9)
+    # camera: frame the whole layout (binary-searched distance + centred target)
+    cam_pos, cam_target, cam_x, cam_y, cam_z = fit_camera(
+        width + margin * 2, depth + margin * 2, max_height=max_height, margin=0.9
+    )
     cam_tf = tf_string(cam_x, cam_y, cam_z, cam_pos)
 
     body = []
-    body.append('[node name="KitchenPropsShowcase" type="Node3D"]')
+    body.append(f'[node name="{Path(out_path).stem}" type="Node3D"]')
     body.append("")
     body.append('[node name="WorldEnvironment" type="WorldEnvironment" parent="."]')
     body.append('environment = SubResource("Environment_main")')
@@ -677,7 +871,7 @@ def write_showcase(
     body.append(f"transform = {tf_string(sun_x, sun_y, sun_z, sun_pos)}")
     body.append("light_energy = 2.0")
     body.append("shadow_enabled = true")
-    body.append("directional_shadow_max_distance = 120.0")
+    body.append(f"directional_shadow_max_distance = {fmt(max(120.0, depth * 3.0))}")
     body.append("")
     body.append('[node name="Floor" type="MeshInstance3D" parent="."]')
     body.append('mesh = SubResource("PlaneMesh_floor")')
@@ -693,27 +887,28 @@ def write_showcase(
     body.append('[node name="Labels" type="Node3D" parent="."]')
     body.append("")
 
-    for i, (name, res) in enumerate(prefabs):
-        col = i % columns
-        row = i // columns
-        x = col * spacing - width / 2.0
-        z = row * spacing - depth / 2.0
+    for i, (cell, x, z, row_d) in enumerate(placed):
+        name = cell["name"]
+        zz = z + z_shift
         body.append(f'[node name="{name}" parent="Prefabs" instance=ExtResource("p{i}")]')
-        body.append(f"transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, {fmt(x)}, 0, {fmt(z)})")
+        body.append(f"transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, {fmt(x)}, 0, {fmt(zz)})")
         body.append("")
         body.append(f'[node name="Label_{name}" type="Label3D" parent="Labels"]')
-        label_tf = tf_string((1, 0, 0), (0, 0, -1), (0, 1, 0), (x, 0.02, z + spacing * 0.42))
+        label_z = zz + row_d / 2.0 - 0.25
+        label_tf = tf_string((1, 0, 0), (0, 0, -1), (0, 1, 0), (x, 0.02, label_z))
         body.append(f"transform = {label_tf}")
         body.append(f'text = "{name}"')
         body.append("font_size = 48")
-        body.append("pixel_size = 0.004")
+        # keep the caption roughly as wide as its cell
+        pixel = min(0.004, max(0.0012, (cell["w"] - margin) / (max(len(name), 8) * 26.0)))
+        body.append(f"pixel_size = {fmt(pixel)}")
         body.append("modulate = Color(0.92, 0.92, 0.88, 1)")
         body.append("outline_size = 10")
         body.append("outline_modulate = Color(0.05, 0.05, 0.05, 1)")
         body.append("no_depth_test = false")
         body.append("")
 
-    load_steps = len(prefabs) + 6  # ext resources + 5 sub-resources + 1
+    load_steps = len(placed) + 6  # ext resources + 5 sub-resources + 1
     text = "\n".join(
         [f"[gd_scene load_steps={load_steps} format=3]", ""]
         + ext_lines
@@ -835,8 +1030,8 @@ def main() -> int:
     ap.add_argument("--dest", default="", help="sub-folder inside the Godot project (default: asset folder name)")
     ap.add_argument("--godot-exe", default="godot", help="path to the Godot 4 editor executable")
     ap.add_argument("--showcase", default="", help="showcase scene file name (default: <dest>Showcase.tscn)")
-    ap.add_argument("--columns", type=int, default=10, help="showcase grid columns")
-    ap.add_argument("--spacing", type=float, default=3.0, help="showcase grid spacing in meters")
+    ap.add_argument("--margin", type=float, default=0.9, help="free space around each showcase cell (meters)")
+    ap.add_argument("--row-width", type=float, default=0.0, help="max showcase row width (0 = derive from the pack)")
     ap.add_argument("--skip-import", action="store_true", help="do not run the engine importer")
     ap.add_argument("--skip-showcase", action="store_true", help="do not build the showcase scene")
     ap.add_argument(
@@ -886,6 +1081,11 @@ def main() -> int:
             if m:
                 mat_guid_to_res[m.group(1)] = f"{dest}/materials/{file_name}"
     print(f"wrote {made_materials} material(s)")
+    if mb.packing_counts:
+        print("  metal/roughness/AO packings: " + ", ".join(
+            f"{k}={v}" for k, v in sorted(mb.packing_counts.items())))
+    if mb.alpha_inverted:
+        print(f"  {len(mb.alpha_inverted)} mask map(s) get their alpha inverted at import")
 
     # ---- 2. copy source assets -------------------------------------------------
     copied = {"meshes": 0, "textures": 0}
@@ -911,7 +1111,9 @@ def main() -> int:
     if not args.skip_import:
         print("running Godot importer ...")
         run_godot(godot_exe, project, ["--import"])
-        changed = patch_texture_imports(textures_dir, index_unity_texture_settings(unity_dir))
+        changed = patch_texture_imports(
+            textures_dir, index_unity_texture_settings(unity_dir), mb.alpha_inverted
+        )
         print(f"patched {changed} texture import setting file(s); re-importing ...")
         run_godot(godot_exe, project, ["--import"])
 
@@ -922,28 +1124,49 @@ def main() -> int:
     if not mesh_ids:
         print("  ! could not extract meshes - prefab scenes will have no mesh")
 
-    def mesh_res_for(guid: str | None) -> str | None:
+    def mesh_res_for(guid: str | None) -> dict | None:
         asset = guid_map.get(guid) if guid else None
         if not asset:
             return None
         return mesh_ids.get(asset.name) or None
 
     made_prefabs: list[tuple[str, str]] = []
+    multi_surface = 0
+    merged_surfaces = 0
+    unassigned_surfaces = 0
     for prefab_file in sorted(unity_dir.rglob("*.prefab")):
         info = parse_prefab(prefab_file)
-        mesh_res = mesh_res_for(info["mesh_guid"])
-        mat_res = None
-        for g in info["materials"]:
-            if g and g in mat_guid_to_res:
-                mat_res = mat_guid_to_res[g]
-                break
+        mesh_info = mesh_res_for(info["mesh_guid"]) or {}
+        mesh_res = mesh_info.get("path") if isinstance(mesh_info, dict) else mesh_info
+        surface_count = mesh_info.get("surfaces", 0) if isinstance(mesh_info, dict) else 0
         name = info["name"]
 
-        ext = []
+        # Unity: m_Materials[i] is the material of submesh i -> surface_material_override/i
+        mat_paths: list[str | None] = []
+        for g in info["materials"]:
+            mat_paths.append(mat_guid_to_res.get(g) if g else None)
+        while mat_paths and mat_paths[-1] is None:
+            mat_paths.pop()          # drop unresolved tail so we don't emit dead overrides
+        if len(mat_paths) > 1:
+            multi_surface += 1
+
+        surface_materials = mesh_info.get("surface_materials", []) if isinstance(mesh_info, dict) else []
+        surface_map, merged = map_materials_to_surfaces(mat_paths, surface_materials)
+        if merged:
+            merged_surfaces += 1
+        if surface_count and len(surface_map) < surface_count:
+            unassigned_surfaces += 1
+
+        ext: list[tuple[str, str, str]] = []
         if mesh_res:
             ext.append(("ArrayMesh", mesh_res, "1_mesh"))
-        if mat_res:
-            ext.append(("Material", "res://" + mat_res, "2_material"))
+        mat_ids: dict[str, str] = {}
+        for i in sorted(surface_map):
+            mp = surface_map[i]
+            if mp not in mat_ids:
+                rid = f"mat{len(mat_ids)}"
+                mat_ids[mp] = rid
+                ext.append(("Material", "res://" + mp, rid))
 
         lines = [f"[gd_scene load_steps={len(ext) + 1} format=3]", ""]
         for rtype, rpath, rid in ext:
@@ -958,19 +1181,26 @@ def main() -> int:
             if tf != "Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)":
                 lines.append(f"transform = {tf}")
             lines.append('mesh = ExtResource("1_mesh")')
-            if mat_res:
-                lines.append('surface_material_override/0 = ExtResource("2_material")')
+            for i in sorted(surface_map):
+                lines.append(f'surface_material_override/{i} = ExtResource("{mat_ids[surface_map[i]]}")')
             lines.append("")
         (prefabs_dir / f"{name}.tscn").write_text("\n".join(lines), encoding="utf-8")
-        made_prefabs.append((name, f"{dest}/prefabs/{name}.tscn"))
+        fp = prefab_footprint(
+            info["rotation"], info["position"], info["scale"], mesh_info.get("aabb") if isinstance(mesh_info, dict) else None
+        )
+        made_prefabs.append((name, f"{dest}/prefabs/{name}.tscn", fp[0], fp[1], fp[2]))
 
-    print(f"wrote {len(made_prefabs)} prefab scene(s)")
+    print(f"wrote {len(made_prefabs)} prefab scene(s) ({multi_surface} with several material slots)")
+    if merged_surfaces:
+        print(f"  {merged_surfaces} prefab(s) needed Unity's merged-submesh mapping")
+    if unassigned_surfaces:
+        print(f"  {unassigned_surfaces} prefab(s) have a submesh without material (also empty in Unity)")
 
     # ---- 5. showcase -----------------------------------------------------------
     if not args.skip_showcase and made_prefabs:
-        showcase_name = args.showcase or f"{dest}Showcase.tscn"
+        showcase_name = args.showcase or f"{Path(dest).name}Showcase.tscn"
         showcase = dest_root / showcase_name
-        write_showcase(showcase, made_prefabs, columns=args.columns, spacing=args.spacing)
+        write_showcase(showcase, made_prefabs, margin=args.margin, max_row_width=args.row_width)
         print(f"wrote showcase scene {showcase.relative_to(project)}")
 
     # tidy up the temporary engine tooling
