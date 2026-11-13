@@ -544,17 +544,59 @@ TEXTURE_IMPORT_PARAMS = {
     "detect_3d/compress_to": "0",   # keep our settings, don't let the editor "detect" them
 }
 
+# Unity's TextureImporterType.NormalMap
+UNITY_TEXTURE_TYPE_NORMAL_MAP = 1
 
-def patch_texture_imports(textures_dir: Path) -> int:
-    """Set 3D-friendly import flags; enable the normal-map flag for *_N maps."""
+
+def read_unity_texture_settings(meta: Path) -> dict:
+    """Read the few TextureImporter settings that matter for a Godot re-import.
+
+    Unity normal maps are the interesting part: `bumpmap.flipGreenChannel` records that
+    Unity flipped the green channel *at import time*, which means the PNG on disk uses the
+    DirectX convention (Y-) while both Unity and Godot shade with the OpenGL convention
+    (Y+). Godot must therefore perform the same flip.
+    """
+    text = meta.read_text(encoding="utf-8", errors="replace")
+
+    def num(pattern: str, default: int) -> int:
+        m = re.search(pattern, text, re.M)
+        return int(m.group(1)) if m else default
+
+    return {
+        "type": num(r"^  textureType: (\d+)", 0),
+        "flip_green": bool(num(r"^    flipGreenChannel: (\d+)", 0)),
+        "srgb": bool(num(r"^    sRGBTexture: (\d+)", 1)),
+        "mipmaps": bool(num(r"^    enableMipMap: (\d+)", 1)),
+    }
+
+
+def index_unity_texture_settings(unity_dir: Path) -> dict[str, dict]:
+    """Map image file name -> TextureImporter settings for every texture in the pack."""
+    out: dict[str, dict] = {}
+    for meta in unity_dir.rglob("*.png.meta"):
+        out[meta.name[: -len(".meta")]] = read_unity_texture_settings(meta)
+    for meta in unity_dir.rglob("*.tga.meta"):
+        out[meta.name[: -len(".meta")]] = read_unity_texture_settings(meta)
+    return out
+
+
+def patch_texture_imports(textures_dir: Path, unity_settings: dict[str, dict] | None = None) -> int:
+    """Set 3D-friendly import flags, mark normal maps and fix their green channel."""
+    unity_settings = unity_settings or {}
     changed = 0
     for imp in textures_dir.glob("*.import"):
         text = imp.read_text(encoding="utf-8")
         params = dict(TEXTURE_IMPORT_PARAMS)
-        # "T_Barrel_N.png.import" -> "T_Barrel_N"
-        base_stem = Path(imp.name[: -len(".import")]).stem
-        is_normal = bool(re.search(r"(_n|_nrm|_normal|_nor)$", base_stem, re.I))
+        image_name = imp.name[: -len(".import")]          # "T_Barrel_N.png"
+        base_stem = Path(image_name).stem                 # "T_Barrel_N"
+        settings = unity_settings.get(image_name, {})
+        is_normal = settings.get("type") == UNITY_TEXTURE_TYPE_NORMAL_MAP or bool(
+            re.search(r"(_n|_nrm|_normal|_nor)$", base_stem, re.I)
+        )
         params["compress/normal_map"] = "1" if is_normal else "0"
+        # DirectX-style (Y-) source map -> invert green so it becomes OpenGL-style (Y+).
+        invert_y = is_normal and settings.get("flip_green", False)
+        params["process/normal_map_invert_y"] = "true" if invert_y else "false"
         new = text
         for key, value in params.items():
             pat = re.compile(rf"^{re.escape(key)}=.*$", re.M)
@@ -869,7 +911,7 @@ def main() -> int:
     if not args.skip_import:
         print("running Godot importer ...")
         run_godot(godot_exe, project, ["--import"])
-        changed = patch_texture_imports(textures_dir)
+        changed = patch_texture_imports(textures_dir, index_unity_texture_settings(unity_dir))
         print(f"patched {changed} texture import setting file(s); re-importing ...")
         run_godot(godot_exe, project, ["--import"])
 
